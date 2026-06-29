@@ -1,0 +1,8 @@
+pydantic~=2.11.5
+fastapi~=0.115.12
+aiosmtpd~=1.4.6
+aiosmtplib~=4.0.1
+aiodns~=3.4.0
+dkimpy~=1.1.8
+aiofiles~=24.1.0
+uvicorn~=0.34.3
