@@ -6,3 +6,4 @@ from .message_sending_log_entry import MessageSendingLogEntry
 from .message_sending_request import MessageSendingRequest
 from .dkim_configuration import DKIMConfiguration
 from .message_sending_result import MessageSendingResult
+from .message_sending_task import MessageSendingTask

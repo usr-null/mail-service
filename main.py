@@ -11,12 +11,13 @@ from model import MessageSummary
 from model import MessageDetails
 from model import MessageSendingRequest
 from model import MessageSendingResult
+from model import MessageSendingTask
 from environment import create_environment
 
 service_environment = create_environment()
 
 mail_handler = MailHandler(ttl=service_environment.ttl)
-mail_sender = MailSender(domain=service_environment.sender_domain, dkim=service_environment.dkim_configuration)
+mail_sender = MailSender(domain=service_environment.sender_domain, ttl=service_environment.ttl, dkim=service_environment.dkim_configuration)
 mail_controller = Controller(
     mail_handler,
     hostname=service_environment.host,
@@ -29,16 +30,25 @@ setup_logging(level=service_environment.log_level)
 @asynccontextmanager
 async def startup_event(_):
     mail_handler.launch_cleanup()
+    mail_sender.launch_cleanup()
     mail_controller.start()
     yield
     mail_controller.stop()
     mail_handler.shutdown_cleanup()
+    mail_sender.shutdown_cleanup()
 
 app = FastAPI(lifespan=startup_event)
 
 @app.get("/message", response_model=List[MessageSummary])
 async def list_messages(skip: int = 0, limit: int = 100) -> List[MessageSummary]:
     return mail_handler.get_messages(skip, limit)
+
+@app.get("/message/async/{task_id}", response_model=MessageSendingTask)
+async def get_async_send_status(task_id: str) -> MessageSendingTask:
+    task = mail_sender.get_send_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404)
+    return task
 
 @app.get("/message/{msg_id}", response_model=MessageDetails)
 async def get_message(msg_id: str) -> MessageDetails:
@@ -50,3 +60,8 @@ async def get_message(msg_id: str) -> MessageDetails:
 @app.post("/message", response_model=MessageSendingResult)
 async def send_message(data: MessageSendingRequest, from_user: str = Query("admin", alias="from"), to: str = Query()) -> MessageSendingResult:
     return await mail_sender.send_mail(from_user, to, data.title, data.content, data.html_content, data.sender_alias)
+
+@app.post("/message/async", response_model=MessageSendingTask)
+async def send_message_async(data: MessageSendingRequest, from_user: str = Query("admin", alias="from"), to: str = Query()) -> MessageSendingTask:
+    task_id = await mail_sender.submit_send_mail(from_user, to, data.title, data.content, data.html_content, data.sender_alias)
+    return MessageSendingTask(task_id=task_id, status="pending")

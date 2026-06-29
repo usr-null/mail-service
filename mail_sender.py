@@ -5,18 +5,25 @@ from email.utils import formatdate
 from dkim import sign
 from aiofiles import open as async_open
 from aiosmtplib import SMTP
-from asyncio import run
+from asyncio import sleep
+from asyncio import create_task
+from asyncio import Task
 from typing import Optional
 from typing import List
+from typing import Dict
 from logging import getLogger
 from sys import exc_info
 from traceback import format_exception
+from datetime import datetime
+from datetime import timezone
+from datetime import timedelta
 from model import MessageSendingStepError
 from model import MessageSendingStepType
 from model import MessageSendingLogEntry
 from model import DKIMConfiguration
 from model import MessageSendingResult
-from pprint import pprint
+from model import MessageSendingTask
+from uuid import uuid4
 
 
 logger = getLogger(__name__)
@@ -41,8 +48,9 @@ def _get_log_entry(step_type: MessageSendingStepType, domain: str) -> MessageSen
     )
 
 class MailSender:
-    def __init__(self, domain: str, dkim: Optional[DKIMConfiguration] = None) -> None:
+    def __init__(self, domain: str, ttl: int, dkim: Optional[DKIMConfiguration] = None) -> None:
         self.domain: str = domain
+        self.ttl: int = ttl
         self.dkim_private_key_cached: Optional[bytes] = None
         self.dkim_config: Optional[DKIMConfiguration] = dkim
         self.resolver: DNSResolver = DNSResolver()
@@ -58,6 +66,11 @@ class MailSender:
             "content-transfer-encoding",
             "mime-version"
         ]
+
+        self._send_tasks: Dict[str, MessageSendingResult] = {}
+        self._send_task_times: Dict[str, datetime] = {}
+        self._pending_tasks: Dict[str, object] = {}
+        self._cleanup_task: Optional[Task] = None
 
     async def _get_mx_hosts(self, host: str) -> List[str]:
         results = await self.resolver.query(host, "MX")
@@ -190,3 +203,66 @@ class MailSender:
                 return MessageSendingResult(success=False, logs=batch)
 
         return MessageSendingResult(success=False, logs=batch)
+
+    async def submit_send_mail(
+        self,
+        from_user: str,
+        to: str,
+        title: str,
+        content: str,
+        html_content: str,
+        sender_alias: Optional[str] = None,
+    ) -> str:
+        task_id = str(uuid4())
+        self._pending_tasks[task_id] = create_task(
+            self._run_send_task(task_id, from_user, to, title, content, html_content, sender_alias)
+        )
+        return task_id
+
+    async def _run_send_task(
+        self,
+        task_id: str,
+        from_user: str,
+        to: str,
+        title: str,
+        content: str,
+        html_content: str,
+        sender_alias: Optional[str],
+    ) -> None:
+        try:
+            result = await self.send_mail(from_user, to, title, content, html_content, sender_alias)
+        except Exception:
+            result = MessageSendingResult(success=False, logs=[])
+        self._send_tasks[task_id] = result
+        self._send_task_times[task_id] = datetime.now(timezone.utc)
+        self._pending_tasks.pop(task_id, None)
+
+    def get_send_task(self, task_id: str) -> Optional[MessageSendingTask]:
+        if task_id in self._send_tasks:
+            return MessageSendingTask(
+                task_id=task_id,
+                status="complete",
+                result=self._send_tasks[task_id],
+            )
+        if task_id in self._pending_tasks:
+            return MessageSendingTask(task_id=task_id, status="pending")
+        return None
+
+    async def cleanup_process(self) -> None:
+        while True:
+            await sleep(self.ttl)
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+            expired = [tid for tid, t in self._send_task_times.items() if t < cutoff]
+            logger.info(f"Cleaning up {len(expired)} send tasks")
+            for tid in expired:
+                self._send_tasks.pop(tid, None)
+                self._send_task_times.pop(tid, None)
+
+    def launch_cleanup(self) -> None:
+        logger.info("Launching send task cleanup")
+        self._cleanup_task = create_task(self.cleanup_process())
+
+    def shutdown_cleanup(self) -> None:
+        logger.info("Shutting down send task cleanup")
+        if self._cleanup_task:
+            self._cleanup_task.cancel()

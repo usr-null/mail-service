@@ -12,7 +12,7 @@
 1. **SMTP server** — accepts inbound mail and stores messages in memory.
 2. **Direct MX delivery** — resolves the recipient's mail server via DNS MX lookup and delivers the message without an intermediate relay.
 
-It exposes a **REST API** (FastAPI) for listing received messages and triggering outbound sends.
+It exposes a **REST API** (FastAPI) for listing received messages and triggering outbound sends. Sending can be synchronous (wait for result) or asynchronous (get a task ID and poll later).
 
 Production use: powers mail delivery on **[Ответы@Live](https://otvet.live)** since early 2024 — over a year on the public internet without issues.
 
@@ -75,9 +75,9 @@ Full message including plain-text body.
 }
 ```
 
-### `POST /message?to=boss@their-company.com&from=admin`
+### `POST /message?to=boss@their-company.com&from=admin` (synchronous)
 
-Send a message. Request body (JSON):
+Send a message, wait for delivery, get the result immediately. Request body (JSON):
 
 ```json
 {
@@ -106,6 +106,45 @@ Response — step-by-step delivery log:
 
 Each step records the MX host and any error with a full Python traceback.
 
+### `POST /message/async?to=boss@their-company.com&from=admin` (asynchronous)
+
+Same request body, but returns immediately with a task ID instead of waiting for delivery:
+
+```json
+{
+  "task_id": "3fa85f64-...",
+  "status": "pending",
+  "result": null
+}
+```
+
+### `GET /message/async/{task_id}`
+
+Poll the status of an asynchronous send. While the task is running:
+
+```json
+{
+  "task_id": "3fa85f64-...",
+  "status": "pending",
+  "result": null
+}
+```
+
+Once finished:
+
+```json
+{
+  "task_id": "3fa85f64-...",
+  "status": "complete",
+  "result": {
+    "success": true,
+    "logs": [ ... ]
+  }
+}
+```
+
+Returns 404 if the task ID is unknown or if the result was already cleaned up (older than 1 hour).
+
 ---
 
 ## Internals
@@ -127,9 +166,8 @@ SMTP client  ──►  aiosmtpd Controller
 - SMTP server: **[aiosmtpd](https://github.com/aio-libs/aiosmtpd)**.
 - Parsing: Python `email` stdlib. Multipart messages are walked for the first `text/plain` part; single-part messages use the top-level body.
 - Encoded headers (`=?UTF-8?B?...?=`) are decoded automatically.
-- Storage: `dict<UUID, MessageDetails>`. A background task deletes entries older than 1 hour.
 
-### Sending
+### Sending (synchronous)
 
 ```
 POST /message
@@ -153,6 +191,27 @@ MailSender.send_mail(from, to, title, ...)
 MessageSendingResult { success, logs[] }
 ```
 
+### Sending (asynchronous)
+
+```
+POST /message/async
+      │
+      ▼
+MailSender.submit_send_mail(...)
+      │
+      ├─ Generate task UUID
+      ├─ Spawn asyncio Task (send_mail in background)
+      └─ Return { task_id, status: "pending" }
+
+GET /message/async/{task_id}
+      │
+      ▼
+MailSender.get_send_task(task_id)
+      │
+      ├─ Task still running → { status: "pending" }
+      └─ Task finished      → { status: "complete", result: ... }
+```
+
 - **No relay.** MX lookup via **[aiodns](https://github.com/saghul/aiodns)**, direct connection to the recipient's mail server on port 25.
 - **Opportunistic STARTTLS.** Upgrades if the remote MX advertises support. Falls back to plain text otherwise.
 - **DKIM signing** (optional). Enabled when `SMTP_DKIM_PRIVATE_KEY` and `SMTP_DKIM_SELECTOR` are set.
@@ -160,7 +219,12 @@ MessageSendingResult { success, logs[] }
 
 ### Cleanup
 
-An `asyncio.Task` runs every `SMTP_TTL` seconds (default 3600) and removes messages older than 1 hour. Cancelled on shutdown.
+Two background `asyncio.Task` instances run independently, each waking every `SMTP_TTL` seconds (default 3600) and purging data older than 1 hour:
+
+- **Inbound messages** — stored `MessageDetails` entries whose `received_time` is past the cutoff.
+- **Completed async send results** — stored results whose completion time is past the cutoff (after cleanup, `GET /message/async/{task_id}` returns 404).
+
+Both are cancelled on shutdown.
 
 ---
 
@@ -187,6 +251,7 @@ All settings via environment variables:
 - **Production-proven.** Used on **[Ответы@Live](https://otvet.live)**, a public Q&A platform, since early 2024.
 - **Zero external mail infrastructure.** No MTA, no relay service required. DNS is the only dependency.
 - **Fully async.** HTTP, SMTP server, SMTP client, DNS, file I/O — all on the asyncio event loop.
+- **Both sync and async sending.** Need the result right away? `POST /message`. Don't want to block? `POST /message/async` + poll with `GET /message/async/{id}`.
 - **Detailed delivery logs.** Every outbound attempt produces a per-step trace with hostnames and full tracebacks on failure.
 - **Swagger UI.** Available at `/docs`.
 - **Small footprint.** 8 dependencies. No database, no message broker.
@@ -198,16 +263,16 @@ All settings via environment variables:
 
 | Limitation | Details |
 |---|---|
-| **In-memory storage** | Messages are lost on restart. No persistence. |
+| **In-memory storage** | Messages and async task results are lost on restart. No persistence. |
 | **No built-in authentication** | SMTP and HTTP endpoints have no auth. By design: authentication is delegated to an external reverse proxy (nginx, Caddy, etc.). Run without one only on a trusted network. |
-| **Fixed 1-hour lifetime** | Cleanup deletes everything older than 1 hour. `SMTP_TTL` controls sweep frequency, not lifetime. |
+| **Fixed 1-hour lifetime** | Cleanup deletes everything older than 1 hour — both received messages and completed async send results. `SMTP_TTL` controls sweep frequency, not lifetime. |
 | **Port 25 only (outbound)** | No support for submission (587) or SMTPS (465). |
 | **Plain-text only (inbound)** | HTML parts of incoming messages are discarded. |
 | **No retry** | Each MX host gets one attempt. No queue, no backoff. |
 | **No rate limiting** | No built-in throttling. |
 | **No address validation** | `to` and `from` are not validated. |
 | **No SPF/DMARC** | DKIM signing is available; SPF/DMARC verification and policy enforcement are not. |
-| **Sender local-part default** | `POST /message` takes `from` as a query parameter defaulting to `"admin"`. The domain is always `SMTP_SENDER_DOMAIN`. |
+| **Sender local-part default** | `POST /message` and `POST /message/async` take `from` as a query parameter defaulting to `"admin"`. The domain is always `SMTP_SENDER_DOMAIN`. |
 
 ---
 
@@ -233,7 +298,7 @@ All settings via environment variables:
 mail-service/
 ├── main.py              # FastAPI app, lifespan, routes
 ├── mail_handler.py      # SMTP receive → parse → store → cleanup
-├── mail_sender.py       # MX lookup → SMTP delivery → DKIM sign
+├── mail_sender.py       # MX lookup → SMTP delivery → DKIM sign → async tasks + cleanup
 ├── environment.py       # Env var → typed config
 ├── logger_cfg.py        # Logging setup
 ├── requirements.txt
@@ -242,6 +307,7 @@ mail-service/
     ├── message_details.py
     ├── message_sending_request.py
     ├── message_sending_result.py
+    ├── message_sending_task.py
     ├── message_sending_log_entry.py
     ├── message_sending_step_error.py
     └── dkim_configuration.py
